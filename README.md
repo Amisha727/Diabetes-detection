@@ -963,7 +963,7 @@ It is **NOT** a substitute for professional medical advice, diagnosis, or treatm
 - [ ] Advanced analytics & cohort analysis
 - [ ] Integration with EHR systems
 - [ ] CI/CD pipeline (GitHub Actions)
-- [ ] Kubernetes deployment config
+- [ ] Kubernetes deployment configuration
 - [ ] Multi-language UI support
 
 ---
