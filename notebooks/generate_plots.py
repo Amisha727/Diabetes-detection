@@ -36,6 +36,15 @@ with open(os.path.join(MODELS_DIR, "artefacts.json"), "r") as f:
     artefacts = json.load(f)
 
 fold_metrics = artefacts["fold_metrics"]
+metrics_all = artefacts.get("metrics", {})
+roc_all = artefacts.get("roc", {})
+pr_all = artefacts.get("pr", {})
+
+model_display_names = {
+    "tabnet": "TabNet",
+    "random_forest": "Random Forest",
+    "xgboost": "XGBoost",
+}
 
 print("Generating publication-quality plots...\n")
 
@@ -116,18 +125,30 @@ print(f"  ✓ Saved to plots/2_confusion_matrix.png\n")
 # 3. ROC CURVE
 # ============================================
 print("3️⃣  Generating: 3_roc_curve.png")
-roc_data = artefacts["roc"]["tabnet"]
-fpr = roc_data["fpr"]
-tpr = roc_data["tpr"]
-auc_score = artefacts["metrics"]["tabnet"]["roc_auc"]
-
 fig, ax = plt.subplots(figsize=(8, 7))
-ax.plot(fpr, tpr, color='#3498db', lw=2.5, label=f'TabNet (AUC = {auc_score:.4f})', marker='o', markersize=3, markevery=50)
+colors = {
+    "tabnet": "#3498db",
+    "random_forest": "#2ecc71",
+    "xgboost": "#e67e22",
+}
+
+for model_key, roc_data in roc_all.items():
+    fpr = roc_data["fpr"]
+    tpr = roc_data["tpr"]
+    auc_score = metrics_all.get(model_key, {}).get("roc_auc", 0.0)
+    label = model_display_names.get(model_key, model_key)
+    ax.plot(
+        fpr,
+        tpr,
+        color=colors.get(model_key, "#34495e"),
+        lw=2.5,
+        label=f"{label} (AUC = {auc_score:.4f})",
+    )
+
 ax.plot([0, 1], [0, 1], color='gray', lw=1.5, linestyle='--', label='Random Classifier', alpha=0.7)
-ax.fill_between(fpr, tpr, alpha=0.2, color='#3498db')
 ax.set_xlabel('False Positive Rate', fontweight='bold', fontsize=12)
 ax.set_ylabel('True Positive Rate', fontweight='bold', fontsize=12)
-ax.set_title('ROC Curve - TabNet Model', fontweight='bold', fontsize=13)
+ax.set_title('ROC Curve Comparison', fontweight='bold', fontsize=13)
 ax.legend(loc='lower right', fontsize=11)
 ax.grid(True, alpha=0.3)
 ax.set_xlim([-0.02, 1.02])
@@ -140,33 +161,46 @@ print(f"  ✓ Saved to plots/3_roc_curve.png\n")
 
 
 # ============================================
-# 4. CALIBRATION CURVE (Reliability Diagram)
+# 4. PRECISION-RECALL CURVE
 # ============================================
-print("4️⃣  Generating: 4_calibration_curve.png")
-np.random.seed(42)
-probs = np.concatenate([
-    np.random.beta(2, 5, sum(y == 0)),
-    np.random.beta(5, 2, sum(y == 1))
-])
-
-prob_true, prob_pred = calibration_curve(y, probs, n_bins=10, strategy='uniform')
+print("4️⃣  Generating: 4_pr_auc_curve.png")
 
 fig, ax = plt.subplots(figsize=(8, 7))
-ax.plot([0, 1], [0, 1], 'k--', lw=2, label='Perfectly Calibrated')
-ax.plot(prob_pred, prob_true, marker='o', markersize=8, lw=2.5, color='#e74c3c', label='TabNet Model')
-ax.fill_between(prob_pred, prob_true, alpha=0.15, color='#e74c3c')
-ax.set_xlabel('Mean Predicted Probability', fontweight='bold', fontsize=12)
-ax.set_ylabel('Fraction of Positives', fontweight='bold', fontsize=12)
-ax.set_title('Calibration Curve (Model Reliability)', fontweight='bold', fontsize=13)
-ax.legend(loc='lower right', fontsize=11)
+for model_key, pr_data in pr_all.items():
+    recall = pr_data["recall"]
+    precision = pr_data["precision"]
+    pr_auc = metrics_all.get(model_key, {}).get("pr_auc", 0.0)
+    label = model_display_names.get(model_key, model_key)
+    ax.plot(
+        recall,
+        precision,
+        lw=2.5,
+        color=colors.get(model_key, "#34495e"),
+        label=f"{label} (PR AUC = {pr_auc:.4f})",
+    )
+
+positive_rate = y.mean()
+ax.hlines(
+    y=positive_rate,
+    xmin=0,
+    xmax=1,
+    colors='gray',
+    linestyles='--',
+    linewidth=1.5,
+    label=f'Baseline (Pos Rate = {positive_rate:.4f})',
+)
+ax.set_xlabel('Recall', fontweight='bold', fontsize=12)
+ax.set_ylabel('Precision', fontweight='bold', fontsize=12)
+ax.set_title('Precision-Recall Curve Comparison', fontweight='bold', fontsize=13)
+ax.legend(loc='lower left', fontsize=10)
 ax.grid(True, alpha=0.3)
 ax.set_xlim([-0.02, 1.02])
 ax.set_ylim([-0.02, 1.02])
 
 plt.tight_layout()
-plt.savefig(os.path.join(PLOTS_DIR, "4_calibration_curve.png"), bbox_inches='tight', dpi=300)
+plt.savefig(os.path.join(PLOTS_DIR, "4_pr_auc_curve.png"), bbox_inches='tight', dpi=300)
 plt.close()
-print(f"  ✓ Saved to plots/4_calibration_curve.png\n")
+print(f"  ✓ Saved to plots/4_pr_auc_curve.png\n")
 
 
 # ============================================
@@ -204,23 +238,29 @@ print(f"  ✓ Saved to plots/5_fold_metrics_comparison.png\n")
 # 6. MODEL METRICS TABLE
 # ============================================
 print("6️⃣  Generating: 6_model_metrics_table.png")
-metrics = artefacts["metrics"]["tabnet"]
+rows = []
+for model_key, model_metrics in metrics_all.items():
+    rows.append({
+        "Model": model_display_names.get(model_key, model_key),
+        "Accuracy": f"{model_metrics.get('accuracy', 0.0):.4f}",
+        "Precision": f"{model_metrics.get('precision', 0.0):.4f}",
+        "Recall": f"{model_metrics.get('recall', 0.0):.4f}",
+        "F1 Score": f"{model_metrics.get('f1_score', 0.0):.4f}",
+        "ROC AUC": f"{model_metrics.get('roc_auc', 0.0):.4f}",
+        "PR AUC": f"{model_metrics.get('pr_auc', 0.0):.4f}",
+        "Brier Score": f"{model_metrics.get('brier_score', 0.0):.4f}",
+    })
 
-metrics_df = pd.DataFrame({
-    "Metric": ["Accuracy", "Precision", "Recall", "F1 Score", "ROC-AUC"],
-    "Value": [f"{metrics['accuracy']:.4f}", f"{metrics['precision']:.4f}", 
-              f"{metrics['recall']:.4f}", f"{metrics['f1_score']:.4f}", 
-              f"{metrics['roc_auc']:.4f}"]
-})
+metrics_df = pd.DataFrame(rows)
 
-fig, ax = plt.subplots(figsize=(8, 4))
+fig, ax = plt.subplots(figsize=(15, 3.8))
 ax.axis('off')
 
 table = ax.table(cellText=metrics_df.values, colLabels=metrics_df.columns, loc='center',
-                cellLoc='center', colWidths=[0.6, 0.4])
+                cellLoc='center', colWidths=[0.18, 0.11, 0.11, 0.11, 0.1, 0.1, 0.1, 0.12])
 table.auto_set_font_size(False)
-table.set_fontsize(11)
-table.scale(1, 2.5)
+table.set_fontsize(10)
+table.scale(1, 2.1)
 
 for i in range(len(metrics_df.columns)):
     table[(0, i)].set_facecolor('#3498db')
@@ -235,6 +275,14 @@ plt.tight_layout()
 plt.savefig(os.path.join(PLOTS_DIR, "6_model_metrics_table.png"), bbox_inches='tight', dpi=300)
 plt.close()
 print(f"  ✓ Saved to plots/6_model_metrics_table.png\n")
+
+print("PR AUC Scores:")
+for model_key, model_metrics in metrics_all.items():
+    print(
+        f"  {model_display_names.get(model_key, model_key)}: "
+        f"{model_metrics.get('pr_auc', 0.0):.4f}"
+    )
+print()
 
 
 # ============================================
