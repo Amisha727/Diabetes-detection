@@ -8,6 +8,9 @@ Implements:
   - SMOTE for class imbalance handling
   - TabNet deep learning model
   - Stratified K-Fold cross validation (k=5)
+  - Hold-out validation (80/20 split)
+  - External dataset validation (Kaggle)
+  - Robustness analysis (multi-seed)
   - Optuna hyperparameter tuning
   - SHAP explainability
   - Model persistence
@@ -28,6 +31,8 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
     roc_curve,
+    precision_recall_curve,
+    average_precision_score,
     confusion_matrix,
 )
 from imblearn.over_sampling import SMOTE
@@ -45,6 +50,7 @@ FINAL_EPOCHS = int(os.getenv("FINAL_EPOCHS", "12"))
 SHAP_BACKGROUND_SIZE = int(os.getenv("SHAP_BACKGROUND_SIZE", "50"))
 SHAP_SAMPLE_SIZE = int(os.getenv("SHAP_SAMPLE_SIZE", "60"))
 SHAP_NSAMPLES = int(os.getenv("SHAP_NSAMPLES", "80"))
+ROBUSTNESS_SEEDS = [42, 123, 256, 512, 1024]
 
 # ──────────────────────────────────────────────
 # Paths
@@ -81,7 +87,7 @@ def load_data():
     return df
 
 
-def preprocess(df: pd.DataFrame):
+def preprocess(df: pd.DataFrame, scaler=None):
     """Replace zero values with median for physiological columns, then standardize."""
     zero_cols = ["Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI"]
     for col in zero_cols:
@@ -92,10 +98,93 @@ def preprocess(df: pd.DataFrame):
     X = df[FEATURES].values
     y = df["Outcome"].values
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    if scaler is None:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+    else:
+        X_scaled = scaler.transform(X)
 
     return X_scaled, y, scaler
+
+
+# ──────────────────────────────────────────────
+# 1b. Load External (Kaggle) Dataset
+# ──────────────────────────────────────────────
+
+# Common features between Pima and external Kaggle dataset
+COMMON_FEATURES = ["Glucose", "BMI", "Age"]
+
+# Mapping from external dataset column names to Pima column names
+EXTERNAL_COL_MAP = {
+    "blood_glucose_level": "Glucose",
+    "bmi": "BMI",
+    "age": "Age",
+    "diabetes": "Outcome",
+}
+
+
+def load_external_dataset():
+    """Load the Kaggle diabetes prediction dataset (iammustafatz) for external validation.
+
+    This dataset has different features than Pima. We align on the common
+    subset: Glucose (blood_glucose_level), BMI (bmi), Age (age).
+    """
+    csv_path = os.path.join(DATA_DIR, "diabetes_prediction_dataset.csv")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"External dataset not found at {csv_path}. "
+            "Place diabetes_prediction_dataset.csv in the data/ folder."
+        )
+
+    df_ext = pd.read_csv(csv_path)
+    print(f"  External dataset loaded: {df_ext.shape[0]} samples, {df_ext.shape[1]} columns")
+
+    # Rename columns to match Pima naming
+    df_ext = df_ext.rename(columns=EXTERNAL_COL_MAP)
+
+    # Keep only the common features + target
+    keep_cols = COMMON_FEATURES + ["Outcome"]
+    missing = [c for c in keep_cols if c not in df_ext.columns]
+    if missing:
+        raise ValueError(f"External dataset missing columns after mapping: {missing}")
+
+    df_ext = df_ext[keep_cols].copy()
+    print(f"  Common features used: {COMMON_FEATURES}")
+    print(f"  External class distribution: "
+          f"{dict(zip(*np.unique(df_ext['Outcome'], return_counts=True)))}")
+    return df_ext
+
+
+def preprocess_external(df_ext: pd.DataFrame, scaler: StandardScaler):
+    """Preprocess external dataset using the TRAINING scaler on common features only.
+
+    Fills remaining Pima features (not present in external data) with the
+    training-set median (i.e. scaler.mean_ from StandardScaler) so they
+    become zero after scaling and don't affect the prediction much.
+    """
+    # Build a full-feature DataFrame with training-set medians as defaults
+    n = len(df_ext)
+    full_df = pd.DataFrame(
+        np.tile(scaler.mean_, (n, 1)),
+        columns=FEATURES,
+    )
+
+    # Overwrite the common features with actual external data
+    for feat in COMMON_FEATURES:
+        full_df[feat] = df_ext[feat].values
+
+    # Replace zeros with NaN then median for physiological columns
+    zero_cols = [c for c in ["Glucose", "BMI"] if c in COMMON_FEATURES]
+    for col in zero_cols:
+        full_df[col] = full_df[col].replace(0, np.nan)
+        median_val = full_df[col].median()
+        full_df[col] = full_df[col].fillna(median_val)
+
+    X = full_df[FEATURES].values
+    y = df_ext["Outcome"].values
+
+    X_scaled = scaler.transform(X)
+    return X_scaled, y
 
 
 # ──────────────────────────────────────────────
@@ -261,6 +350,12 @@ def train_tabnet_kfold(X, y, best_params, n_splits=5):
     fpr, tpr, _ = roc_curve(all_y_true, all_y_prob)
     roc_data = {"fpr": fpr.tolist(), "tpr": tpr.tolist()}
 
+    # Precision-Recall curve
+    pr_precision, pr_recall, _ = precision_recall_curve(all_y_true, all_y_prob)
+    pr_auc = round(float(average_precision_score(all_y_true, all_y_prob)), 4)
+    pr_data = {"precision": pr_precision.tolist(), "recall": pr_recall.tolist()}
+    avg["pr_auc"] = pr_auc
+
     cm = confusion_matrix(
         all_y_true, [1 if p >= 0.5 else 0 for p in all_y_prob]
     ).tolist()
@@ -272,7 +367,141 @@ def train_tabnet_kfold(X, y, best_params, n_splits=5):
         if k != "model":
             print(f"    {k:>12}: {v}")
 
-    return best_model, avg, roc_data, fold_metrics, cm
+    return best_model, avg, roc_data, pr_data, fold_metrics, cm
+
+
+# ──────────────────────────────────────────────
+# 4b. Hold-out Evaluation
+# ──────────────────────────────────────────────
+
+
+def evaluate_holdout(model, X_test, y_test):
+    """Evaluate trained model on strictly unseen hold-out test set."""
+    print("\n  Evaluating on hold-out test set...")
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        "accuracy": round(float(accuracy_score(y_test, y_pred)), 4),
+        "precision": round(float(precision_score(y_test, y_pred)), 4),
+        "recall": round(float(recall_score(y_test, y_pred)), 4),
+        "f1_score": round(float(f1_score(y_test, y_pred)), 4),
+        "roc_auc": round(float(roc_auc_score(y_test, y_prob)), 4),
+    }
+
+    cm = confusion_matrix(y_test, y_pred).tolist()
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    roc_data = {"fpr": fpr.tolist(), "tpr": tpr.tolist()}
+
+    print(f"    Hold-out Results:")
+    for k, v in metrics.items():
+        print(f"      {k:>12}: {v}")
+
+    return metrics, cm, roc_data
+
+
+# ──────────────────────────────────────────────
+# 4c. External Dataset Validation
+# ──────────────────────────────────────────────
+
+
+def evaluate_external(model, X_ext, y_ext):
+    """Evaluate model trained on Pima against external Kaggle dataset."""
+    print("\n  Evaluating on external (Kaggle) dataset...")
+    y_pred = model.predict(X_ext)
+    y_prob = model.predict_proba(X_ext)[:, 1]
+
+    metrics = {
+        "accuracy": round(float(accuracy_score(y_ext, y_pred)), 4),
+        "precision": round(float(precision_score(y_ext, y_pred)), 4),
+        "recall": round(float(recall_score(y_ext, y_pred)), 4),
+        "f1_score": round(float(f1_score(y_ext, y_pred)), 4),
+        "roc_auc": round(float(roc_auc_score(y_ext, y_prob)), 4),
+    }
+
+    cm = confusion_matrix(y_ext, y_pred).tolist()
+    fpr, tpr, _ = roc_curve(y_ext, y_prob)
+    roc_data = {"fpr": fpr.tolist(), "tpr": tpr.tolist()}
+
+    print(f"    External Validation Results:")
+    for k, v in metrics.items():
+        print(f"      {k:>12}: {v}")
+
+    return metrics, cm, roc_data
+
+
+# ──────────────────────────────────────────────
+# 4d. Robustness Analysis (Multi-Seed)
+# ──────────────────────────────────────────────
+
+
+def robustness_analysis(X_train, y_train, X_test, y_test, best_params, seeds=None):
+    """Run training multiple times with different random seeds to assess stability."""
+    if seeds is None:
+        seeds = ROBUSTNESS_SEEDS
+
+    print(f"\n  Robustness analysis ({len(seeds)} seeds)...")
+
+    lr = best_params.get("learning_rate", 0.02)
+    batch_size = best_params.get("batch_size", 128)
+    tabnet_params = {k: v for k, v in best_params.items()
+                     if k in ("n_d", "n_a", "n_steps", "gamma", "lambda_sparse",
+                              "momentum", "mask_type")}
+
+    all_run_metrics = []
+
+    for i, seed in enumerate(seeds, 1):
+        smote = SMOTE(random_state=seed)
+        X_tr_res, y_tr_res = smote.fit_resample(X_train, y_train)
+
+        model = TabNetClassifier(
+            **tabnet_params,
+            optimizer_params={"lr": lr},
+            scheduler_params={"step_size": 10, "gamma": 0.9},
+            scheduler_fn=__import__("torch").optim.lr_scheduler.StepLR,
+            verbose=0,
+            seed=seed,
+        )
+        model.fit(
+            X_tr_res, y_tr_res,
+            eval_set=[(X_test, y_test)],
+            eval_metric=["auc"],
+            max_epochs=FINAL_EPOCHS,
+            patience=20,
+            batch_size=batch_size,
+        )
+
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+
+        run_metrics = {
+            "seed": seed,
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "precision": float(precision_score(y_test, y_pred)),
+            "recall": float(recall_score(y_test, y_pred)),
+            "f1_score": float(f1_score(y_test, y_pred)),
+            "roc_auc": float(roc_auc_score(y_test, y_prob)),
+        }
+        all_run_metrics.append(run_metrics)
+
+        print(f"    Seed {seed}: ACC={run_metrics['accuracy']:.4f}  "
+              f"F1={run_metrics['f1_score']:.4f}  AUC={run_metrics['roc_auc']:.4f}")
+
+    # Compute mean and std
+    metric_keys = ["accuracy", "precision", "recall", "f1_score", "roc_auc"]
+    summary = {}
+    for key in metric_keys:
+        vals = [m[key] for m in all_run_metrics]
+        summary[key] = {
+            "mean": round(float(np.mean(vals)), 4),
+            "std": round(float(np.std(vals)), 4),
+        }
+
+    print(f"\n    Robustness Summary (mean ± std):")
+    for k, v in summary.items():
+        print(f"      {k:>12}: {v['mean']:.4f} ± {v['std']:.4f}")
+
+    return {"runs": all_run_metrics, "summary": summary}
 
 
 # ──────────────────────────────────────────────
@@ -344,9 +573,12 @@ def get_tabnet_attention(model, X):
 # ──────────────────────────────────────────────
 
 
-def save_artefacts(model, scaler, metrics, roc_data, fold_metrics,
+def save_artefacts(model, scaler, metrics, roc_data, pr_data, fold_metrics,
                    confusion, shap_importance, attention_importance,
-                   background, best_params):
+                   background, best_params,
+                   holdout_metrics=None, holdout_cm=None, holdout_roc=None,
+                   external_metrics=None, external_cm=None, external_roc=None,
+                   robustness_results=None):
     # Save TabNet model
     model_path = os.path.join(MODELS_DIR, "tabnet_model")
     model.save_model(model_path)
@@ -363,6 +595,9 @@ def save_artefacts(model, scaler, metrics, roc_data, fold_metrics,
             "preprocessing": "Median imputation + StandardScaler",
             "class_balancing": "SMOTE",
             "cross_validation": "Stratified 5-Fold",
+            "holdout_split": "80% train / 20% test (stratified)",
+            "external_validation": "Kaggle Diabetes Prediction (iammustafatz) — common features: Glucose, BMI, Age",
+            "robustness_analysis": f"Multi-seed ({len(ROBUSTNESS_SEEDS)} seeds)",
             "hyperparameter_tuning": f"Optuna ({OPTUNA_TRIALS} trials)",
             "explainability": "SHAP (KernelExplainer) + TabNet Attention Masks",
         },
@@ -371,12 +606,33 @@ def save_artefacts(model, scaler, metrics, roc_data, fold_metrics,
         "fold_metrics": fold_metrics,
         "confusion_matrix": confusion,
         "roc": {"tabnet": roc_data},
+        "pr": {"tabnet": pr_data},
         "feature_importance": {
             "tabnet_shap": shap_importance,
             "tabnet_attention": attention_importance,
         },
         "features": FEATURES,
     }
+
+    # Hold-out validation results
+    if holdout_metrics is not None:
+        artefacts["holdout_validation"] = {
+            "metrics": holdout_metrics,
+            "confusion_matrix": holdout_cm,
+            "roc": holdout_roc,
+        }
+
+    # External validation results
+    if external_metrics is not None:
+        artefacts["external_validation"] = {
+            "metrics": external_metrics,
+            "confusion_matrix": external_cm,
+            "roc": external_roc,
+        }
+
+    # Robustness analysis results
+    if robustness_results is not None:
+        artefacts["robustness_analysis"] = robustness_results
 
     with open(os.path.join(MODELS_DIR, "artefacts.json"), "w") as f:
         json.dump(artefacts, f, indent=2)
@@ -393,34 +649,68 @@ def main():
     print("=" * 60)
     print("  AI-Driven Diabetes Detection Training Pipeline")
     print("  TabNet + SMOTE + Stratified K-Fold + Optuna + SHAP")
+    print("  + Hold-Out + External Validation + Robustness")
     print("=" * 60)
 
-    print("\n[1/6] Loading dataset...")
+    print("\n[1/9] Loading dataset...")
     df = load_data()
     print(f"  Dataset: {df.shape[0]} samples, {df.shape[1]} columns")
     print(
         f"  Class distribution: {dict(zip(*np.unique(df['Outcome'], return_counts=True)))}")
 
-    print("\n[2/6] Preprocessing...")
-    X, y, scaler = preprocess(df)
+    print("\n[2/9] Preprocessing & Hold-Out Split...")
+    X, y, scaler = preprocess(df.copy())
 
-    print("\n[3/6] Hyperparameter tuning with Optuna...")
-    best_params = tune_hyperparameters(X, y, n_trials=OPTUNA_TRIALS)
+    # ── Hold-out split: 80% train, 20% test (STRICTLY unseen) ──
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=42, stratify=y
+    )
+    print(f"  Train set: {X_train.shape[0]} samples")
+    print(f"  Test set (hold-out): {X_test.shape[0]} samples")
 
-    print("\n[4/6] Training TabNet with Stratified 5-Fold CV...")
-    model, metrics, roc_data, fold_metrics, confusion = train_tabnet_kfold(
-        X, y, best_params.copy(), n_splits=5
+    print("\n[3/9] Hyperparameter tuning with Optuna (on train set only)...")
+    best_params = tune_hyperparameters(X_train, y_train, n_trials=OPTUNA_TRIALS)
+
+    print("\n[4/9] Training TabNet with Stratified 5-Fold CV (on train set only)...")
+    model, metrics, roc_data, pr_data, fold_metrics, cv_confusion = train_tabnet_kfold(
+        X_train, y_train, best_params.copy(), n_splits=5
     )
 
-    print("\n[5/6] Computing explainability...")
-    shap_importance, background = compute_shap(model, X)
-    attention_importance = get_tabnet_attention(model, X)
+    print("\n[5/9] Hold-out evaluation (strictly unseen test set)...")
+    holdout_metrics, holdout_cm, holdout_roc = evaluate_holdout(model, X_test, y_test)
 
-    print("\n[6/6] Saving artefacts...")
+    print("\n[6/9] External dataset validation...")
+    external_metrics, external_cm, external_roc = None, None, None
+    try:
+        df_ext = load_external_dataset()
+        X_ext, y_ext = preprocess_external(df_ext.copy(), scaler)
+        external_metrics, external_cm, external_roc = evaluate_external(
+            model, X_ext, y_ext
+        )
+    except Exception as e:
+        print(f"  WARNING: External validation skipped: {e}")
+
+    print("\n[7/9] Robustness analysis (multi-seed)...")
+    robustness_results = robustness_analysis(
+        X_train, y_train, X_test, y_test, best_params.copy()
+    )
+
+    print("\n[8/9] Computing explainability...")
+    shap_importance, background = compute_shap(model, X_train)
+    attention_importance = get_tabnet_attention(model, X_train)
+
+    print("\n[9/9] Saving artefacts...")
     save_artefacts(
-        model, scaler, metrics, roc_data, fold_metrics,
-        confusion, shap_importance, attention_importance,
+        model, scaler, metrics, roc_data, pr_data, fold_metrics,
+        cv_confusion, shap_importance, attention_importance,
         background, best_params,
+        holdout_metrics=holdout_metrics,
+        holdout_cm=holdout_cm,
+        holdout_roc=holdout_roc,
+        external_metrics=external_metrics,
+        external_cm=external_cm,
+        external_roc=external_roc,
+        robustness_results=robustness_results,
     )
 
     print("\n" + "=" * 60)
