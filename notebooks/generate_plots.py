@@ -12,7 +12,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 MODELS_DIR = os.path.join(PROJECT_DIR, "models")
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
-PLOTS_DIR = os.path.join(PROJECT_DIR, "plots")
+PLOTS_DIR = os.path.join(PROJECT_DIR, "plots3")
 
 # Create plots directory
 os.makedirs(PLOTS_DIR, exist_ok=True)
@@ -386,5 +386,216 @@ print("="*60)
 print("✅ All plots generated successfully!")
 print(f"📁 Location: {PLOTS_DIR}")
 print("="*60)
+for f in sorted(os.listdir(PLOTS_DIR)):
+    print(f"  ✓ {f}")
+
+
+# ============================================
+# 10. HOLD-OUT CONFUSION MATRIX
+# ============================================
+if "holdout_validation" in artefacts:
+    print("\n🔟  Generating: holdout_confusion_matrix.png")
+    ho = artefacts["holdout_validation"]
+    ho_cm = np.array(ho["confusion_matrix"])
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    sns.heatmap(ho_cm, annot=True, fmt='d', cmap='Oranges', cbar=True, ax=ax,
+                xticklabels=['Non-Diabetic', 'Diabetic'],
+                yticklabels=['Non-Diabetic', 'Diabetic'],
+                annot_kws={'size': 14, 'weight': 'bold'},
+                cbar_kws={'label': 'Count'})
+    ax.set_ylabel('True Label', fontweight='bold', fontsize=12)
+    ax.set_xlabel('Predicted Label', fontweight='bold', fontsize=12)
+    ax.set_title('Hold-Out Test Set Confusion Matrix', fontweight='bold', fontsize=13)
+
+    tn, fp, fn, tp = ho_cm.ravel()
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+    plt.text(0.5, -0.15, f'Sensitivity: {sens:.3f} | Specificity: {spec:.3f}',
+             ha='center', transform=ax.transAxes, fontsize=10, style='italic')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "holdout_confusion_matrix.png"), bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"  ✓ Saved to plots/holdout_confusion_matrix.png\n")
+else:
+    print("\n⚠️  Skipping holdout_confusion_matrix.png (no holdout data in artefacts)\n")
+
+
+# ============================================
+# 11. EXTERNAL VALIDATION ROC CURVE
+# ============================================
+if "external_validation" in artefacts:
+    print("1️⃣1️⃣  Generating: external_validation_roc.png")
+    ev = artefacts["external_validation"]
+    ev_roc = ev["roc"]
+    ev_auc = ev["metrics"]["roc_auc"]
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.plot(ev_roc["fpr"], ev_roc["tpr"], color='#e74c3c', lw=2.5,
+            label=f'External Validation (AUC = {ev_auc:.4f})')
+
+    # Overlay Pima CV ROC for comparison
+    if "tabnet" in roc_all:
+        pima_auc = metrics_all.get("tabnet", {}).get("roc_auc", 0.0)
+        ax.plot(roc_all["tabnet"]["fpr"], roc_all["tabnet"]["tpr"],
+                color='#3498db', lw=2.5, linestyle='--',
+                label=f'Cross-Validation (AUC = {pima_auc:.4f})')
+
+    # Overlay hold-out ROC
+    if "holdout_validation" in artefacts:
+        ho_roc = artefacts["holdout_validation"]["roc"]
+        ho_auc = artefacts["holdout_validation"]["metrics"]["roc_auc"]
+        ax.plot(ho_roc["fpr"], ho_roc["tpr"],
+                color='#2ecc71', lw=2.5, linestyle='-.',
+                label=f'Hold-Out (AUC = {ho_auc:.4f})')
+
+    ax.plot([0, 1], [0, 1], color='gray', lw=1.5, linestyle='--',
+            label='Random Classifier', alpha=0.7)
+    ax.set_xlabel('False Positive Rate', fontweight='bold', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontweight='bold', fontsize=12)
+    ax.set_title('External Validation ROC Curve', fontweight='bold', fontsize=13)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([-0.02, 1.02])
+    ax.set_ylim([-0.02, 1.02])
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "external_validation_roc.png"), bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"  ✓ Saved to plots/external_validation_roc.png\n")
+else:
+    print("⚠️  Skipping external_validation_roc.png (no external data in artefacts)\n")
+
+
+# ============================================
+# 12. ROBUSTNESS METRICS (Mean ± Std)
+# ============================================
+if "robustness_analysis" in artefacts:
+    print("1️⃣2️⃣  Generating: robustness_metrics.png")
+    rob = artefacts["robustness_analysis"]
+    rob_summary = rob["summary"]
+    metric_names = list(rob_summary.keys())
+    means = [rob_summary[m]["mean"] for m in metric_names]
+    stds = [rob_summary[m]["std"] for m in metric_names]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(metric_names))
+    colors_rob = ['#3498db', '#2ecc71', '#e67e22', '#9b59b6', '#e74c3c']
+    bars = ax.bar(x, means, yerr=stds, capsize=8, color=colors_rob[:len(metric_names)],
+                  edgecolor='black', linewidth=1.5, alpha=0.85, error_kw={'linewidth': 2})
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([m.replace('_', ' ').title() for m in metric_names],
+                       fontweight='bold', fontsize=10)
+    ax.set_ylabel('Score', fontweight='bold', fontsize=12)
+    ax.set_title(f'Robustness Analysis (Mean ± Std over {len(rob["runs"])} Seeds)',
+                 fontweight='bold', fontsize=13)
+    ax.set_ylim([0, 1.1])
+    ax.grid(axis='y', alpha=0.3)
+
+    for i, (bar, m, s) in enumerate(zip(bars, means, stds)):
+        ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height() + s + 0.02,
+                f'{m:.4f}\n±{s:.4f}', ha='center', va='bottom',
+                fontweight='bold', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "robustness_metrics.png"), bbox_inches='tight', dpi=300)
+    plt.close()
+    print(f"  ✓ Saved to plots/robustness_metrics.png\n")
+else:
+    print("⚠️  Skipping robustness_metrics.png (no robustness data in artefacts)\n")
+
+
+# ============================================
+# 13. COMPARISON TABLE (CV vs Hold-out vs External)
+# ============================================
+print("1️⃣3️⃣  Generating: comparison_table.png")
+
+comp_rows = []
+
+# Cross-Validation metrics
+if "tabnet" in metrics_all:
+    cv_m = metrics_all["tabnet"]
+    comp_rows.append({
+        "Validation": "5-Fold CV",
+        "Accuracy": f"{cv_m.get('accuracy', 0):.4f}",
+        "Precision": f"{cv_m.get('precision', 0):.4f}",
+        "Recall": f"{cv_m.get('recall', 0):.4f}",
+        "F1 Score": f"{cv_m.get('f1_score', 0):.4f}",
+        "ROC AUC": f"{cv_m.get('roc_auc', 0):.4f}",
+    })
+
+# Hold-out metrics
+if "holdout_validation" in artefacts:
+    ho_m = artefacts["holdout_validation"]["metrics"]
+    comp_rows.append({
+        "Validation": "Hold-Out (20%)",
+        "Accuracy": f"{ho_m.get('accuracy', 0):.4f}",
+        "Precision": f"{ho_m.get('precision', 0):.4f}",
+        "Recall": f"{ho_m.get('recall', 0):.4f}",
+        "F1 Score": f"{ho_m.get('f1_score', 0):.4f}",
+        "ROC AUC": f"{ho_m.get('roc_auc', 0):.4f}",
+    })
+
+# External validation metrics
+if "external_validation" in artefacts:
+    ex_m = artefacts["external_validation"]["metrics"]
+    comp_rows.append({
+        "Validation": "External (Kaggle)",
+        "Accuracy": f"{ex_m.get('accuracy', 0):.4f}",
+        "Precision": f"{ex_m.get('precision', 0):.4f}",
+        "Recall": f"{ex_m.get('recall', 0):.4f}",
+        "F1 Score": f"{ex_m.get('f1_score', 0):.4f}",
+        "ROC AUC": f"{ex_m.get('roc_auc', 0):.4f}",
+    })
+
+# Robustness mean ± std
+if "robustness_analysis" in artefacts:
+    rb = artefacts["robustness_analysis"]["summary"]
+    comp_rows.append({
+        "Validation": "Robustness (mean±std)",
+        "Accuracy": f"{rb['accuracy']['mean']:.4f}±{rb['accuracy']['std']:.4f}",
+        "Precision": f"{rb['precision']['mean']:.4f}±{rb['precision']['std']:.4f}",
+        "Recall": f"{rb['recall']['mean']:.4f}±{rb['recall']['std']:.4f}",
+        "F1 Score": f"{rb['f1_score']['mean']:.4f}±{rb['f1_score']['std']:.4f}",
+        "ROC AUC": f"{rb['roc_auc']['mean']:.4f}±{rb['roc_auc']['std']:.4f}",
+    })
+
+comp_df = pd.DataFrame(comp_rows)
+
+fig, ax = plt.subplots(figsize=(15, 2.5 + 0.6 * len(comp_rows)))
+ax.axis('off')
+
+table = ax.table(cellText=comp_df.values, colLabels=comp_df.columns, loc='center',
+                 cellLoc='center',
+                 colWidths=[0.22, 0.13, 0.13, 0.13, 0.13, 0.13])
+table.auto_set_font_size(False)
+table.set_fontsize(10)
+table.scale(1, 2.2)
+
+for j in range(len(comp_df.columns)):
+    table[(0, j)].set_facecolor('#2c3e50')
+    table[(0, j)].set_text_props(weight='bold', color='white')
+
+row_colors = ['#dfe6e9', '#ffffff', '#dfe6e9', '#ffffff']
+for i in range(1, len(comp_df) + 1):
+    for j in range(len(comp_df.columns)):
+        table[(i, j)].set_facecolor(row_colors[(i - 1) % len(row_colors)])
+
+plt.title('Validation Metrics Comparison (TabNet)', fontweight='bold', fontsize=13, pad=20)
+plt.tight_layout()
+plt.savefig(os.path.join(PLOTS_DIR, "comparison_table.png"), bbox_inches='tight', dpi=300)
+plt.close()
+print(f"  ✓ Saved to plots/comparison_table.png\n")
+
+
+# ============================================
+# FINAL SUMMARY
+# ============================================
+print("=" * 60)
+print("✅ All publication plots generated!")
+print(f"📁 Location: {PLOTS_DIR}")
+print("=" * 60)
 for f in sorted(os.listdir(PLOTS_DIR)):
     print(f"  ✓ {f}")
